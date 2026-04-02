@@ -1,0 +1,16 @@
+# 編集出力・中間ファイル
+runs/
+
+# Python仮想環境
+python/.venv/
+
+# 環境変数（HF_TOKEN等）
+python/.env
+
+# Python キャッシュ
+__pycache__/
+*.pyc
+
+# OS
+Thumbs.db
+.DS_Store
