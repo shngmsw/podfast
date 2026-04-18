@@ -5,6 +5,37 @@ import json
 from pathlib import Path
 
 
+def load_words(stt_path: str) -> list[dict]:
+    """STT結果から単語リストを取得"""
+    with open(stt_path, encoding="utf-8") as f:
+        stt = json.load(f)
+    return [w for w in stt.get("words", []) if w.get("start") is not None and w.get("end") is not None]
+
+
+def snap_to_word_boundary(t: float, words: list[dict], snap_window: float,
+                           max_word_duration: float = 1.5) -> float:
+    """カット境界を単語末尾にスナップする
+
+    カット境界が単語の途中に入っている場合のみスナップする。
+    keep_segment の末端・先頭いずれも同じロジック:
+      t が単語途中（word_start < t < word_end）かつ
+      word_end - t が snap_window 以内なら word_end にスナップ。
+
+    snap_window       : word_end が t から最大この秒数以内ならスナップ
+    max_word_duration : これより長い単語はWhisperXアライメントエラーとして除外
+    """
+    for w in words:
+        if (w["end"] - w["start"]) > max_word_duration:
+            continue
+        ws, we = w["start"], w["end"]
+        # t が単語の途中にある
+        if ws < t < we:
+            # word_end まで延ばす（snap_window 以内のみ）
+            if we - t <= snap_window:
+                return we
+    return t
+
+
 def merge_cut_segments(vad_path: str, filler_path: str, retake_path: str) -> list[dict]:
     """無音・フィラー・言い直しのカット区間をマージ"""
 
@@ -48,8 +79,18 @@ def merge_cut_segments(vad_path: str, filler_path: str, retake_path: str) -> lis
     return cut_regions
 
 
-def compute_keep_segments(total_duration: float, cut_regions: list[dict], min_segment_ms: int = 300) -> list[dict]:
-    """カット区間の補集合 = 残す区間を算出"""
+def compute_keep_segments(total_duration: float, cut_regions: list[dict],
+                           min_segment_ms: int = 300, pre_roll_ms: int = 0,
+                           words: list[dict] | None = None,
+                           word_snap_ms: float = 1000) -> list[dict]:
+    """カット区間の補集合 = 残す区間を算出
+
+    pre_roll_ms  : 各セグメントの開始をN ms手前に延ばす（話し始めの音が切れる場合に使用）
+    words        : STT単語リスト。指定時はカット境界を最近傍の単語境界にスナップする
+    word_snap_ms : スナップの最大許容距離（ms）。これより遠い単語境界はスナップしない
+    """
+    pre_roll = pre_roll_ms / 1000
+    snap_window = word_snap_ms / 1000
 
     # カット区間をマージ（重複解消）
     merged_cuts = []
@@ -61,23 +102,44 @@ def compute_keep_segments(total_duration: float, cut_regions: list[dict], min_se
 
     # 残す区間を算出
     keep_segments = []
-    prev_end = 0.0
+    prev_keep_end = 0.0
+    prev_cut_end = 0.0
+    snapped_count = 0
+
     for cut in merged_cuts:
-        if cut["start"] - prev_end >= min_segment_ms / 1000:
+        seg_start = max(prev_keep_end, prev_cut_end - pre_roll)
+        seg_end = cut["start"]
+
+        # 単語境界スナップ
+        if words:
+            orig_start, orig_end = seg_start, seg_end
+            seg_end = snap_to_word_boundary(seg_end, words, snap_window)
+            seg_start = snap_to_word_boundary(seg_start, words, snap_window)
+            if seg_end != orig_end or seg_start != orig_start:
+                snapped_count += 1
+
+        if seg_end - seg_start >= min_segment_ms / 1000:
             keep_segments.append({
-                "start": round(prev_end, 3),
-                "end": round(cut["start"], 3),
-                "duration": round(cut["start"] - prev_end, 3),
+                "start": round(seg_start, 3),
+                "end": round(seg_end, 3),
+                "duration": round(seg_end - seg_start, 3),
             })
-        prev_end = cut["end"]
+            prev_keep_end = seg_end
+        prev_cut_end = cut["end"]
 
     # 末尾
-    if total_duration - prev_end >= min_segment_ms / 1000:
+    seg_start = max(prev_keep_end, prev_cut_end - pre_roll)
+    if words:
+        seg_start = snap_to_word_boundary(seg_start, words, snap_window)
+    if total_duration - seg_start >= min_segment_ms / 1000:
         keep_segments.append({
-            "start": round(prev_end, 3),
+            "start": round(seg_start, 3),
             "end": round(total_duration, 3),
-            "duration": round(total_duration - prev_end, 3),
+            "duration": round(total_duration - seg_start, 3),
         })
+
+    if words and snapped_count:
+        print(f"[INFO] 単語境界スナップ: {snapped_count}件のセグメント境界を調整")
 
     return keep_segments
 
@@ -89,6 +151,12 @@ def main():
     parser.add_argument("--retake", required=True)
     parser.add_argument("--metadata", required=True, help="step01のmetadata.json")
     parser.add_argument("--output", required=True)
+    parser.add_argument("--pre-roll-ms", type=int, default=0,
+                        help="各セグメント開始をN ms手前に延ばす（話し始めの音切れ対策）")
+    parser.add_argument("--stt", default=None,
+                        help="stt_result.json。指定するとカット境界を単語末尾にスナップする")
+    parser.add_argument("--word-snap-ms", type=float, default=1000,
+                        help="単語境界スナップの最大許容距離（ms）。デフォルト1000ms")
     args = parser.parse_args()
 
     # メタデータから総時間取得
@@ -99,8 +167,17 @@ def main():
     # カット区間をマージ
     cut_regions = merge_cut_segments(args.vad, args.filler, args.retake)
 
+    # 単語リスト（スナップ用）
+    words = None
+    if args.stt and Path(args.stt).exists():
+        words = load_words(args.stt)
+        print(f"[INFO] STT単語データ読み込み: {len(words)}語")
+
     # keep_segments算出
-    keep_segments = compute_keep_segments(total_duration, cut_regions)
+    keep_segments = compute_keep_segments(total_duration, cut_regions,
+                                          pre_roll_ms=args.pre_roll_ms,
+                                          words=words,
+                                          word_snap_ms=args.word_snap_ms)
 
     # 統計
     kept_duration = sum(s["duration"] for s in keep_segments)

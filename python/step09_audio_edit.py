@@ -17,18 +17,44 @@ import sys
 import tempfile
 from pathlib import Path
 
+# OS共通の一時ディレクトリ（/tmp, %TEMP% 等）
+_TMPDIR = Path(tempfile.gettempdir())
 
-def apply_cuts_to_track(input_path: str, keep_segments: list[dict], output_path: str) -> None:
+
+def merge_adjacent_segments(segments: list[dict], gap_threshold: float = 0.0) -> list[dict]:
+    """gap_threshold 以下の間隔で連続するセグメントを結合する
+
+    ゼロギャップの隣接セグメントを結合することで、同一点での
+    fade-out/fade-in の二重適用による音量ディップを防ぐ。
+    """
+    if not segments:
+        return segments
+    merged = [dict(segments[0])]
+    for seg in segments[1:]:
+        gap = seg["start"] - merged[-1]["end"]
+        if gap <= gap_threshold:
+            merged[-1]["end"] = seg["end"]
+            merged[-1]["duration"] = merged[-1]["end"] - merged[-1]["start"]
+        else:
+            merged.append(dict(seg))
+    return merged
+
+
+def apply_cuts_to_track(input_path: str, keep_segments: list[dict], output_path: str,
+                        fade_ms: float = 50) -> None:
     """1トラックにカット提案を適用（バッチ処理対応）"""
     if not keep_segments:
         print(f"[WARN] keep_segmentsが空: {input_path}", file=sys.stderr)
         return
 
+    # ゼロギャップの隣接セグメントをマージして二重フェードを防ぐ
+    keep_segments = merge_adjacent_segments(keep_segments, gap_threshold=0.0)
+
     n = len(keep_segments)
     BATCH_SIZE = 200  # ffmpegのfilter_complex制限回避
 
     if n <= BATCH_SIZE:
-        _apply_cuts_single(input_path, keep_segments, output_path)
+        _apply_cuts_single(input_path, keep_segments, output_path, fade_ms=fade_ms)
     else:
         # バッチに分割して処理 → 最後に結合
         batch_files = []
@@ -36,7 +62,7 @@ def apply_cuts_to_track(input_path: str, keep_segments: list[dict], output_path:
         for batch_idx in range(0, n, BATCH_SIZE):
             batch_segs = keep_segments[batch_idx:batch_idx + BATCH_SIZE]
             batch_path = str(out_dir / f"_batch_{batch_idx}.wav")
-            _apply_cuts_single(input_path, batch_segs, batch_path)
+            _apply_cuts_single(input_path, batch_segs, batch_path, fade_ms=fade_ms)
             batch_files.append(batch_path)
             print(f"  batch {batch_idx//BATCH_SIZE+1}/{(n+BATCH_SIZE-1)//BATCH_SIZE}")
 
@@ -66,14 +92,21 @@ def apply_cuts_to_track(input_path: str, keep_segments: list[dict], output_path:
             os.remove(list_path)
 
 
-def _apply_cuts_single(input_path: str, keep_segments: list[dict], output_path: str) -> None:
-    """1バッチ分のカット適用"""
+def _apply_cuts_single(input_path: str, keep_segments: list[dict], output_path: str,
+                        fade_ms: float = 50) -> None:
+    """1バッチ分のカット適用（接合部にフェードを付けてクリックノイズを防止）"""
     n = len(keep_segments)
+    fade_d = fade_ms / 1000  # 秒
 
     filter_parts = []
     for i, seg in enumerate(keep_segments):
+        dur = seg['end'] - seg['start']
+        # セグメントが短すぎる場合はフェードを縮小（1/4以内）
+        f = min(fade_d, dur / 4)
         filter_parts.append(
-            f"[0:a]atrim=start={seg['start']}:end={seg['end']},asetpts=PTS-STARTPTS[s{i}]"
+            f"[0:a]atrim=start={seg['start']}:end={seg['end']},asetpts=PTS-STARTPTS,"
+            f"afade=t=in:st=0:d={f:.4f},"
+            f"afade=t=out:st={max(0, dur - f):.4f}:d={f:.4f}[s{i}]"
         )
 
     if n == 1:
@@ -108,51 +141,70 @@ def apply_crosstalk_processing(track_path: str, speaker: str,
                                 crosstalk: list[dict], output_path: str) -> None:
     """クロストーク処理（ダッキング/ミュート）をトラックに適用
 
-    volume filterで該当区間の音量を下げる/ゼロにする。
+    複数の volume= フィルターを連結してスクリプトファイル経由で渡す。
+    （コマンドライン長制限を回避し、Windows/macOS/Linux 共通で動作）
     """
-    # この話者がtarget_speakerになっている区間を抽出
     actions = [ct for ct in crosstalk
                if ct.get("target_speaker") == speaker and ct["action"] in ("ducking", "mute")]
 
     if not actions:
-        # 処理不要: そのままコピー
         shutil.copy2(track_path, output_path)
         return
 
-    # volume filterを構築
-    # enable='between(t,start,end)' で区間指定
-    filter_chain = ""
+    filter_parts = []
     for act in actions:
-        start = act["start"]
-        end = act["end"]
+        s, e = act["start"], act["end"]
         if act["action"] == "mute":
-            vol = 0
+            vol = 0.0
         else:
             db = act.get("ducking_db", -12)
-            vol = 10 ** (db / 20)  # dBをリニアに変換
+            vol = 10 ** (db / 20)
+        filter_parts.append(f"volume=enable='between(t,{s},{e})':volume={vol:.4f}")
 
-        if filter_chain:
-            filter_chain += ","
-        filter_chain += f"volume=enable='between(t,{start},{end})':volume={vol:.4f}"
-
-    if not filter_chain:
+    if not filter_parts:
         shutil.copy2(track_path, output_path)
         return
+
+    # フィルタースクリプトファイル経由（コマンドライン長制限回避・Windows互換）
+    filter_str = f"[0:a]{','.join(filter_parts)}[out]"
+    safe_speaker = "".join(c if c.isalnum() or c in "-_" else "_" for c in speaker)
+    filter_path = str(Path(output_path).parent / f"_ct_{safe_speaker}_filter.txt")
+    with open(filter_path, "w", encoding="utf-8") as f:
+        f.write(filter_str)
 
     cmd = [
         "ffmpeg", "-y", "-i", str(track_path),
-        "-af", filter_chain,
+        "-filter_complex_script", filter_path,
+        "-map", "[out]",
         "-ar", "48000", "-ac", "1", "-c:a", "pcm_s16le",
         str(output_path)
     ]
     result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    os.remove(filter_path)
     if result.returncode != 0:
-        print(f"[ERROR] クロストーク処理失敗 ({speaker}): {result.stderr}", file=sys.stderr)
+        print(f"[ERROR] クロストーク処理失敗 ({speaker}): {result.stderr[-400:]}", file=sys.stderr)
         sys.exit(1)
 
 
+def measure_lufs(track_path: str) -> float | None:
+    """ffmpeg loudnorm でトラックの integrated LUFS を測定"""
+    cmd = [
+        "ffmpeg", "-i", str(track_path),
+        "-af", "loudnorm=I=-23:TP=-1.5:LRA=11:print_format=json",
+        "-f", "null", os.devnull
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    stats = parse_loudnorm_stats(result.stderr)
+    if stats:
+        try:
+            return float(stats["input_i"])
+        except (KeyError, ValueError):
+            return None
+    return None
+
+
 def mixdown_tracks(track_paths: list[str], output_path: str) -> None:
-    """複数トラックをミックスダウン（各トラック-3dBで合成）"""
+    """複数トラックをミックスダウン（per-track LUFS 正規化後に合成）"""
     if len(track_paths) == 1:
         shutil.copy2(track_paths[0], output_path)
         return
@@ -162,10 +214,26 @@ def mixdown_tracks(track_paths: list[str], output_path: str) -> None:
     for t in track_paths:
         inputs += ["-i", t]
 
-    # 各トラックを-3dB (0.7079)にして合成。片方のみ時-3dB、両方時±0dB。
+    # 各トラックの LUFS を測定し -23 LUFS を目標にゲイン補正
+    # → ミックス後の LUFS 正規化（-16）と独立して、まず話者間レベルを揃える
+    _TARGET_LUFS = -23.0
+    _MAX_GAIN_DB = 20.0   # 正方向のゲインを上限クランプ（クリップ防止）
+    _MIN_GAIN_DB = -40.0  # 負方向のゲインの下限
+    gains = []
+    for t in track_paths:
+        lufs = measure_lufs(t)
+        if lufs is not None and lufs > -70.0:
+            gain_db = max(_MIN_GAIN_DB, min(_MAX_GAIN_DB, _TARGET_LUFS - lufs))
+            gains.append(10 ** (gain_db / 20))
+            print(f"[INFO]   LUFS測定: {lufs:.1f} LUFS → gain {gain_db:+.1f}dB ({Path(t).name})")
+        else:
+            gains.append(0.7079)  # 測定失敗時フォールバック -3dB
+            print(f"[WARN]   LUFS測定失敗、-3dB フォールバック ({Path(t).name})")
+
+    # per-track ゲイン補正後にミックス
     filter_parts = []
-    for i in range(n):
-        filter_parts.append(f"[{i}:a]volume=0.7079[s{i}]")
+    for i, gain in enumerate(gains):
+        filter_parts.append(f"[{i}:a]volume={gain:.4f}[s{i}]")
     input_labels = "".join(f"[s{i}]" for i in range(n))
     filter_parts.append(f"{input_labels}amix=inputs={n}:duration=longest:normalize=0[out]")
     filter_str = ";\n".join(filter_parts)
@@ -202,6 +270,8 @@ def normalize_and_encode(input_path: str, output_path: str,
     """2パス ラウドネス正規化 + エンコード"""
     if fmt == "mp3":
         codec_args = ["-c:a", "libmp3lame", "-b:a", "320k"]
+    elif fmt == "wav":
+        codec_args = ["-c:a", "pcm_s16le"]
     else:
         codec_args = ["-c:a", "aac", "-b:a", "256k"]
 
@@ -245,6 +315,38 @@ def normalize_and_encode(input_path: str, output_path: str,
         sys.exit(1)
 
 
+def generate_preview(track_paths: list[str], output_path: str, speed: float = 2.0) -> None:
+    """複数トラックをミックスして指定倍速のプレビューWAVを生成"""
+    n = len(track_paths)
+    inputs = []
+    for t in track_paths:
+        inputs += ["-i", t]
+
+    vol = 0.7079  # -3dB
+    filter_parts = [f"[{i}:a]volume={vol}[s{i}]" for i in range(n)]
+    mix_label = "".join(f"[s{i}]" for i in range(n))
+    filter_parts.append(f"{mix_label}amix=inputs={n}:duration=longest:normalize=0,atempo={speed}[out]")
+    filter_str = ";\n".join(filter_parts)
+
+    filter_path = str(Path(output_path).parent / "_preview_filter.txt")
+    with open(filter_path, "w", encoding="utf-8") as f:
+        f.write(filter_str)
+
+    cmd = ["ffmpeg", "-y"] + inputs + [
+        "-filter_complex_script", filter_path,
+        "-map", "[out]",
+        "-ar", "48000", "-ac", "1", "-c:a", "pcm_s16le",
+        output_path
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    os.remove(filter_path)
+    if result.returncode != 0:
+        print(f"[WARN] プレビュー生成失敗: {result.stderr[:300]}", file=sys.stderr)
+        return
+    size_mb = Path(output_path).stat().st_size / 1024 ** 2
+    print(f"[INFO] プレビュー出力: {output_path} ({size_mb:.0f}MB, {speed}x速)")
+
+
 def main():
     parser = argparse.ArgumentParser(description="音声編集 + クロストーク処理 + ラウドネス正規化")
     parser.add_argument("--metadata", required=True, help="step01のmetadata.json")
@@ -252,9 +354,13 @@ def main():
     parser.add_argument("--crosstalk", default=None, help="crosstalk_result.json")
     parser.add_argument("--tracks-dir", default=None, help="高音質トラックディレクトリ（48kHz WAV等）")
     parser.add_argument("--output", required=True, help="出力ディレクトリ")
-    parser.add_argument("--format", default="mp3", choices=["mp3", "m4a"])
+    parser.add_argument("--format", default="mp3", choices=["mp3", "m4a", "wav"])
     parser.add_argument("--lufs", type=float, default=-16)
     parser.add_argument("--sample-rate", type=int, default=48000, help="中間・出力サンプルレート")
+    parser.add_argument("--two-track", action="store_true",
+                        help="ミックスダウンせず、トラック別に個別出力する（手動編集用）")
+    parser.add_argument("--preview", action="store_true",
+                        help="2倍速プレビューWAVを /tmp/{run_id}_preview_2x.wav に出力する")
     args = parser.parse_args()
 
     with open(args.metadata, encoding="utf-8") as f:
@@ -269,6 +375,7 @@ def main():
         crosstalk_data = ct.get("overlaps", [])
 
     keep_segments = cuts["keep_segments"]
+    crossfade_ms = cuts.get("crossfade_ms", 50)
     out_path = Path(args.output)
     out_path.mkdir(parents=True, exist_ok=True)
     tracks_out = out_path / "tracks"
@@ -287,17 +394,19 @@ def main():
     def resolve_track_source(track_info):
         """トラックのソースWAVを解決"""
         speaker = track_info["speaker"]
-        # 1. 高音質ディレクトリから探す
+        # 1. metadata の source フィールド（元ファイル）を優先
+        source_file = track_info.get("source")
+        if source_file:
+            p = Path(source_file).resolve()
+            if p.exists():
+                return str(p)
+        # 2. 高音質ディレクトリが指定されている場合、インデックス順でマッチ
         if hq_tracks_dir and hq_tracks_dir.exists():
-            for wav in hq_tracks_dir.glob("*.wav"):
-                if speaker in wav.name or track_info.get("stream_index", -1) == int(wav.name.split("_")[1]) if "_" in wav.name else False:
-                    return str(wav)
-            # ファイル一覧から最初にマッチするものを返す
             wavs = sorted(hq_tracks_dir.glob("*.wav"))
             idx = metadata["speakers"].index(speaker) if speaker in metadata["speakers"] else -1
             if 0 <= idx < len(wavs):
                 return str(wavs[idx])
-        # 2. metadata記載パスから探す
+        # 3. metadata記載パス（step01の16kHz変換済みトラック）
         track_file = track_info["path"]
         p = Path(track_file).resolve()
         if p.exists():
@@ -313,7 +422,7 @@ def main():
             print(f"[ERROR] トラックファイルが見つかりません", file=sys.stderr)
             sys.exit(1)
         cut_path = tracks_out / "cut_mixed.wav"
-        apply_cuts_to_track(source, keep_segments, str(cut_path))
+        apply_cuts_to_track(source, keep_segments, str(cut_path), fade_ms=crossfade_ms)
         mixed_path = str(cut_path)
         print("[INFO] シングルトラック: カット適用完了")
 
@@ -329,15 +438,38 @@ def main():
             print(f"[INFO] トラック処理: {speaker} ({source})")
 
             # 1. カット適用
-            cut_path = tracks_out / f"cut_{speaker}.wav"
-            apply_cuts_to_track(source, keep_segments, str(cut_path))
+            safe_speaker = "".join(c if c.isalnum() or c in "-_" else "_" for c in speaker)
+            cut_path = tracks_out / f"cut_{safe_speaker}.wav"
+            apply_cuts_to_track(source, keep_segments, str(cut_path), fade_ms=crossfade_ms)
 
             # 2. クロストーク処理
-            ct_path = tracks_out / f"ct_{speaker}.wav"
+            ct_path = tracks_out / f"ct_{safe_speaker}.wav"
             apply_crosstalk_processing(str(cut_path), speaker, crosstalk_data, str(ct_path))
 
             processed_tracks.append(str(ct_path))
             print(f"[INFO]   -> カット + クロストーク処理完了")
+
+        if args.two_track:
+            # 2トラック個別出力: ミックスダウンせず各トラックを個別に正規化・エンコード
+            ext = args.format
+            for i, (track_info, ct_path) in enumerate(zip(tracks, processed_tracks)):
+                speaker = track_info["speaker"]
+                safe_speaker = "".join(c if c.isalnum() or c in "-_" else "_" for c in speaker)
+                final_path = out_path / f"track_{i+1:02d}_{safe_speaker}.{ext}"
+                normalize_and_encode(ct_path, str(final_path), args.lufs, args.format)
+                print(f"[INFO] 2トラック出力 [{i+1}/{len(tracks)}]: {final_path}")
+            # プレビュー生成
+            if args.preview:
+                run_id = Path(args.output).parent.name
+                preview_path = str(_TMPDIR / f"{run_id}_preview_2x.wav")
+                generate_preview(processed_tracks, preview_path)
+            # 出力情報表示して終了
+            ct_mute = sum(1 for c in crosstalk_data if c.get("action") == "mute")
+            ct_duck = sum(1 for c in crosstalk_data if c.get("action") == "ducking")
+            print(f"[INFO] 2トラック出力完了: {len(tracks)}ファイル, LUFS {args.lufs}")
+            if crosstalk_data:
+                print(f"[INFO] クロストーク処理: ミュート{ct_mute}件, ダッキング{ct_duck}件")
+            return
 
         # 3. ミックスダウン
         mixed_path = str(tracks_out / "mixed.wav")
@@ -362,6 +494,13 @@ def main():
     print(f"[INFO] 出力: {output_duration:.1f}秒, {ext.upper()}, LUFS {args.lufs}")
     if crosstalk_data:
         print(f"[INFO] クロストーク処理: ミュート{ct_mute}件, ダッキング{ct_duck}件")
+
+    # プレビュー生成（シングルミックス or マルチトラック問わず）
+    if args.preview:
+        run_id = Path(args.output).parent.name
+        preview_path = str(_TMPDIR / f"{run_id}_preview_2x.wav")
+        preview_sources = processed_tracks if mode != "single" else [mixed_path]
+        generate_preview(preview_sources, preview_path)
 
 
 if __name__ == "__main__":
