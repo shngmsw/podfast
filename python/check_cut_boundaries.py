@@ -131,6 +131,12 @@ def main():
     print("カット境界 × 単語境界 分析")
     print("=" * 50)
     print(f"総カット境界数 : {total}件")
+    if total == 0:
+        print("  境界なし: keep_segments が1件以下のため分析対象のカット境界がありません")
+        print()
+        print("[診断]")
+        print("  keep_segments が1件以下のため、カット境界の集計はスキップしました")
+        return
     print(f"  clean      : {len(clean)}件 ({len(clean)/total*100:.0f}%)")
     print(f"  risky      : {len(risky)}件 ({len(risky)/total*100:.0f}%)  ← フェード内に単語境界")
     print(f"  mid-word   : {len(mid_word)}件 ({len(mid_word)/total*100:.0f}%)  ← 単語の途中でカット")

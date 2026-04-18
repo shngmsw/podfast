@@ -167,7 +167,8 @@ def apply_crosstalk_processing(track_path: str, speaker: str,
 
     # フィルタースクリプトファイル経由（コマンドライン長制限回避・Windows互換）
     filter_str = f"[0:a]{','.join(filter_parts)}[out]"
-    filter_path = str(Path(output_path).parent / f"_ct_{speaker}_filter.txt")
+    safe_speaker = "".join(c if c.isalnum() or c in "-_" else "_" for c in speaker)
+    filter_path = str(Path(output_path).parent / f"_ct_{safe_speaker}_filter.txt")
     with open(filter_path, "w", encoding="utf-8") as f:
         f.write(filter_str)
 
@@ -216,11 +217,13 @@ def mixdown_tracks(track_paths: list[str], output_path: str) -> None:
     # 各トラックの LUFS を測定し -23 LUFS を目標にゲイン補正
     # → ミックス後の LUFS 正規化（-16）と独立して、まず話者間レベルを揃える
     _TARGET_LUFS = -23.0
+    _MAX_GAIN_DB = 20.0   # 正方向のゲインを上限クランプ（クリップ防止）
+    _MIN_GAIN_DB = -40.0  # 負方向のゲインの下限
     gains = []
     for t in track_paths:
         lufs = measure_lufs(t)
         if lufs is not None and lufs > -70.0:
-            gain_db = _TARGET_LUFS - lufs
+            gain_db = max(_MIN_GAIN_DB, min(_MAX_GAIN_DB, _TARGET_LUFS - lufs))
             gains.append(10 ** (gain_db / 20))
             print(f"[INFO]   LUFS測定: {lufs:.1f} LUFS → gain {gain_db:+.1f}dB ({Path(t).name})")
         else:
@@ -435,11 +438,12 @@ def main():
             print(f"[INFO] トラック処理: {speaker} ({source})")
 
             # 1. カット適用
-            cut_path = tracks_out / f"cut_{speaker}.wav"
+            safe_speaker = "".join(c if c.isalnum() or c in "-_" else "_" for c in speaker)
+            cut_path = tracks_out / f"cut_{safe_speaker}.wav"
             apply_cuts_to_track(source, keep_segments, str(cut_path), fade_ms=crossfade_ms)
 
             # 2. クロストーク処理
-            ct_path = tracks_out / f"ct_{speaker}.wav"
+            ct_path = tracks_out / f"ct_{safe_speaker}.wav"
             apply_crosstalk_processing(str(cut_path), speaker, crosstalk_data, str(ct_path))
 
             processed_tracks.append(str(ct_path))
@@ -448,12 +452,11 @@ def main():
         if args.two_track:
             # 2トラック個別出力: ミックスダウンせず各トラックを個別に正規化・エンコード
             ext = args.format
-            final_paths = []
             for i, (track_info, ct_path) in enumerate(zip(tracks, processed_tracks)):
                 speaker = track_info["speaker"]
-                final_path = out_path / f"track_{i+1:02d}_{speaker}.{ext}"
+                safe_speaker = "".join(c if c.isalnum() or c in "-_" else "_" for c in speaker)
+                final_path = out_path / f"track_{i+1:02d}_{safe_speaker}.{ext}"
                 normalize_and_encode(ct_path, str(final_path), args.lufs, args.format)
-                final_paths.append(str(final_path))
                 print(f"[INFO] 2トラック出力 [{i+1}/{len(tracks)}]: {final_path}")
             # プレビュー生成
             if args.preview:

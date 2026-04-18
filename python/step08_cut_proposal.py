@@ -12,25 +12,23 @@ def load_words(stt_path: str) -> list[dict]:
     return [w for w in stt.get("words", []) if w.get("start") is not None and w.get("end") is not None]
 
 
-def snap_to_word_boundary(t: float, words: list[dict], direction: str, snap_window: float,
+def snap_to_word_boundary(t: float, words: list[dict], snap_window: float,
                            max_word_duration: float = 1.5) -> float:
     """カット境界を単語末尾にスナップする
 
     カット境界が単語の途中に入っている場合のみスナップする。
-    「途中に入っている」 = その単語の end が t + snap_window 以内にある。
+    keep_segment の末端・先頭いずれも同じロジック:
+      t が単語途中（word_start < t < word_end）かつ
+      word_end - t が snap_window 以内なら word_end にスナップ。
 
-    direction='left' : keep_segment の末端（カット開始点）
-                       t が単語途中 → その単語の word_end までスナップ（末尾まで残す）
-    direction='right': keep_segment の先頭（カット終了点）
-                       t が単語途中 → その単語の word_end までスナップ（先頭を送らせる）
     snap_window       : word_end が t から最大この秒数以内ならスナップ
-    max_word_duration : これより長い単語はアライメントエラーとして除外
+    max_word_duration : これより長い単語はWhisperXアライメントエラーとして除外
     """
     for w in words:
         if (w["end"] - w["start"]) > max_word_duration:
             continue
         ws, we = w["start"], w["end"]
-        # t が単語の途中にある（word_start < t < word_end）
+        # t が単語の途中にある
         if ws < t < we:
             # word_end まで延ばす（snap_window 以内のみ）
             if we - t <= snap_window:
@@ -84,7 +82,7 @@ def merge_cut_segments(vad_path: str, filler_path: str, retake_path: str) -> lis
 def compute_keep_segments(total_duration: float, cut_regions: list[dict],
                            min_segment_ms: int = 300, pre_roll_ms: int = 0,
                            words: list[dict] | None = None,
-                           word_snap_ms: float = 300) -> list[dict]:
+                           word_snap_ms: float = 1000) -> list[dict]:
     """カット区間の補集合 = 残す区間を算出
 
     pre_roll_ms  : 各セグメントの開始をN ms手前に延ばす（話し始めの音が切れる場合に使用）
@@ -115,8 +113,8 @@ def compute_keep_segments(total_duration: float, cut_regions: list[dict],
         # 単語境界スナップ
         if words:
             orig_start, orig_end = seg_start, seg_end
-            seg_end = snap_to_word_boundary(seg_end, words, "left", snap_window)
-            seg_start = snap_to_word_boundary(seg_start, words, "right", snap_window)
+            seg_end = snap_to_word_boundary(seg_end, words, snap_window)
+            seg_start = snap_to_word_boundary(seg_start, words, snap_window)
             if seg_end != orig_end or seg_start != orig_start:
                 snapped_count += 1
 
@@ -132,7 +130,7 @@ def compute_keep_segments(total_duration: float, cut_regions: list[dict],
     # 末尾
     seg_start = max(prev_keep_end, prev_cut_end - pre_roll)
     if words:
-        seg_start = snap_to_word_boundary(seg_start, words, "right", snap_window)
+        seg_start = snap_to_word_boundary(seg_start, words, snap_window)
     if total_duration - seg_start >= min_segment_ms / 1000:
         keep_segments.append({
             "start": round(seg_start, 3),
