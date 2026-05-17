@@ -437,17 +437,18 @@ def main():
                 sys.exit(1)
             print(f"[INFO] トラック処理: {speaker} ({source})")
 
-            # 1. カット適用
+            # 1. クロストーク処理（カット前の元タイムライン上で適用）
+            #    crosstalk の start/end は元音声基準のため、カット前に適用する。
             safe_speaker = "".join(c if c.isalnum() or c in "-_" else "_" for c in speaker)
-            cut_path = tracks_out / f"cut_{safe_speaker}.wav"
-            apply_cuts_to_track(source, keep_segments, str(cut_path), fade_ms=crossfade_ms)
-
-            # 2. クロストーク処理
             ct_path = tracks_out / f"ct_{safe_speaker}.wav"
-            apply_crosstalk_processing(str(cut_path), speaker, crosstalk_data, str(ct_path))
+            apply_crosstalk_processing(source, speaker, crosstalk_data, str(ct_path))
 
-            processed_tracks.append(str(ct_path))
-            print(f"[INFO]   -> カット + クロストーク処理完了")
+            # 2. カット適用
+            cut_path = tracks_out / f"cut_{safe_speaker}.wav"
+            apply_cuts_to_track(str(ct_path), keep_segments, str(cut_path), fade_ms=crossfade_ms)
+
+            processed_tracks.append(str(cut_path))
+            print(f"[INFO]   -> クロストーク処理 + カット完了")
 
         if args.two_track:
             # 2トラック個別出力: ミックスダウンせず各トラックを個別に正規化・エンコード
