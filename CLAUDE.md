@@ -63,8 +63,14 @@ runs/{run_id}/
 ├── transcript.md             # 話者ラベル付き全文トランスクリプト
 ├── chapters.json             # チャプターマーカー (タイムスタンプ + タイトル)
 ├── chapters.txt              # Podcastアプリ用チャプターテキスト
-├── shownotes.md              # ショーノーツ (要約・ハイライト)
+├── shownotes.md              # ショーノーツ (要約・ハイライト・編集メモ)
+├── shownotes.html            # 配信用ショーノーツ (定型HTML)
 └── edit_report.md            # 編集レポート (カット数・削減率・クロストーク処理数等)
+
+## 番組プロフィール
+shownotes.html のリード文の枕・フッターなど番組固有の値は `show_profile.local.md`
+（gitignore 対象・リポジトリにはコミットしない）に置く。
+新しい番組を扱うときはこのファイルに項目を追加する。
 
 ## クロストーク処理
 複数トラックで発話が被った区間の処理方式:

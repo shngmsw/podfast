@@ -17,13 +17,17 @@ from pathlib import Path
 
 
 def get_probe(input_path: str) -> dict:
+    # Windows パスのバックスラッシュを ffprobe に渡すと JSON 出力でエスケープ問題が起きるため
+    # フォワードスラッシュに統一する
+    safe_path = str(input_path).replace("\\", "/")
     cmd = [
         "ffprobe", "-v", "quiet",
         "-print_format", "json",
         "-show_format", "-show_streams",
-        str(input_path)
+        safe_path
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, text=True,
+                            encoding="utf-8", errors="replace")
     if result.returncode != 0:
         print(f"[ERROR] ffprobe失敗: {result.stderr}", file=sys.stderr)
         sys.exit(1)

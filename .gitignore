@@ -14,3 +14,9 @@ __pycache__/
 # OS
 Thumbs.db
 .DS_Store
+
+# 番組固有の設定（コミットしない）
+show_profile.local.md
+
+# 入力音声（コミットしない）
+input/
