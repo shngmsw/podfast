@@ -453,11 +453,11 @@ def main():
         if args.two_track:
             # 2トラック個別出力: ミックスダウンせず各トラックを個別に正規化・エンコード
             ext = args.format
-            for i, (track_info, ct_path) in enumerate(zip(tracks, processed_tracks)):
+            for i, (track_info, track_path) in enumerate(zip(tracks, processed_tracks)):
                 speaker = track_info["speaker"]
                 safe_speaker = "".join(c if c.isalnum() or c in "-_" else "_" for c in speaker)
                 final_path = out_path / f"track_{i+1:02d}_{safe_speaker}.{ext}"
-                normalize_and_encode(ct_path, str(final_path), args.lufs, args.format)
+                normalize_and_encode(track_path, str(final_path), args.lufs, args.format)
                 print(f"[INFO] 2トラック出力 [{i+1}/{len(tracks)}]: {final_path}")
             # プレビュー生成
             if args.preview:
